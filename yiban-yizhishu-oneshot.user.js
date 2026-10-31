@@ -94,6 +94,69 @@
     return listRows().filter((r) => r.btnEdit).length >= 2;
   }
 
+  /* ------------------------ 分页（MDC pagination） ------------------------ */
+  // 结构：共 N 条 / «上一页 / 页码按钮（当前页带 mdc-pagination__button--active）/ 下一页» / 跳页输入框
+  function totalCount() {
+    const el = document.querySelector('.mdc-data-table__pagination-total span');
+    const m = el && el.textContent.match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : 0;
+  }
+
+  function pageButtons() {
+    return Array.from(document.querySelectorAll(
+      '.mdc-data-table__pagination-page button.mdc-data-table__pagination-button'));
+  }
+
+  function currentPage() {
+    const active = document.querySelector(
+      '.mdc-data-table__pagination-page button.mdc-pagination__button--active');
+    if (active) {
+      const n = parseInt(labelOf(active), 10);
+      if (Number.isFinite(n)) return n;
+    }
+    return 1;
+  }
+
+  function totalPages() {
+    // 优先用跳页输入框的 max 属性，其次用页码按钮里最大的数字
+    const inp = document.querySelector('.mdc-data-table__pagination-jumper-input input');
+    if (inp && inp.max) {
+      const n = parseInt(inp.max, 10);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    let max = 1;
+    pageButtons().forEach((b) => {
+      const n = parseInt(labelOf(b), 10);
+      if (Number.isFinite(n) && n > max) max = n;
+    });
+    return max;
+  }
+
+  function findPageButton(n) {
+    return pageButtons().find((b) => parseInt(labelOf(b), 10) === n) || null;
+  }
+
+  // 切到第 n 页：先点页码按钮，点不到（被省略号折叠）就用跳页输入框
+  async function gotoPage(n) {
+    if (currentPage() === n && listReady()) return true;
+    const btn = findPageButton(n);
+    if (btn) {
+      realClick(btn);
+    } else {
+      const inp = document.querySelector('.mdc-data-table__pagination-jumper-input input');
+      if (!inp) return false;
+      inp.focus();
+      inp.value = String(n);
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+      ['keydown', 'keyup'].forEach((t) => inp.dispatchEvent(
+        new KeyboardEvent(t, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })));
+    }
+    const ok = await waitFor(() => currentPage() === n && listReady(), 15000);
+    if (ok) await sleep(300);   // 等表格重排完
+    return ok;
+  }
+
   /* ============================ ① 状态着色 ============================ */
   const STYLE_ID = 'yb-enhance-style';
   function injectStyle() {
@@ -135,7 +198,6 @@
     });
     updateStat(on, off);
   }
-
   /* ============================ ② 横向滚轮 ============================ */
   let scrollHooked = false;
   function fixHScroll() {
@@ -209,6 +271,12 @@
           </label>
           <button id="yb-refresh" style="margin-left:auto;border:1px solid #4b5563;border-radius:5px;background:#374151;color:#e5e7eb;padding:2px 8px;cursor:pointer;">刷新</button>
         </div>
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;color:#9ca3af;">
+          <label>最多跑</label>
+          <input id="yb-pages" type="number" min="0" step="1" value="0" title="0 = 所有页；填 2 = 只跑第 1、2 页" style="width:48px;background:#0b1220;border:1px solid #4b5563;border-radius:4px;color:#e5e7eb;padding:2px 4px;">
+          <label>页（0=全部）</label>
+          <span id="yb-pageinfo" style="margin-left:auto;color:#6b7280;"></span>
+        </div>
         <div id="yb-log" style="max-height:132px;overflow:auto;background:#0b1220;border:1px solid #374151;border-radius:6px;padding:6px;color:#9ca3af;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;"></div>
       </div>
     `;
@@ -256,8 +324,12 @@
   function updateStat(on, off) {
     if (!statEl) return;
     statEl.innerHTML = `未提交 <b style="color:#f87171">${off}</b> · 已提交 <b style="color:#4ade80">${on}</b>`;
+    const info = document.getElementById('yb-pageinfo');
+    if (info) {
+      const tp = totalPages();
+      info.textContent = tp > 1 ? `第 ${currentPage()}/${tp} 页 · 共 ${totalCount() || '?'} 条` : '';
+    }
   }
-
   function renderLog() {
     if (!logEl) return;
     logEl.textContent = logs.slice(-40).join('\n');
@@ -267,8 +339,8 @@
   /* ============================ ④ 单条提交流程 ============================ */
   // 站点自身的坑：列表里的「提交」按钮点了不生效（时间字段未初始化），
   // 必须走「编辑 → 编辑页底部提交」，这里就照这条唯一有效的路走。
-  async function submitOne(row, idx, total) {
-    const tag = `#${idx}/${total} id=${row.id || '?'} [${row.status}]`;
+  async function submitOne(row, idx) {
+    const tag = `#${idx} id=${row.id || '?'} [${row.status}]`;
     log(`${tag} 点「编辑」`);
 
     realClick(row.btnEdit);
@@ -366,24 +438,40 @@
     runBtn.disabled = true;
     runBtn.style.opacity = '.6';
 
+    const pageLimitEl = panel.querySelector('#yb-pages');
+    const pageLimit = Math.max(0, parseInt(pageLimitEl && pageLimitEl.value, 10) || 0);
+    const tried = new Set();      // 提交失败/跳过的行，避免死循环重试
+
     let ok = 0, fail = 0;
     try {
-      // 每轮重新扫描：提交完以后 DOM 会重排，别拿着旧引用
-      let round = 0;
+      let page = currentPage();
+      const pages = totalPages();
+      log(`开工：共 ${totalCount() || '?'} 条 / ${pages} 页，` +
+          (pageLimit > 0 ? `只跑前 ${pageLimit} 页` : '跑所有页') +
+          (dryRun ? '（干跑）' : ''));
+
       while (!stopFlag) {
-        round++;
-        // 每次都得确认回到了列表，否则可能在编辑页里误点
-        if (!(await waitFor(() => listReady(), 12000))) {
-          log('回不到列表页，停止');
-          break;
+        if (pageLimit > 0 && page > pageLimit) { log(`已跑满设定的 ${pageLimit} 页，停止`); break; }
+        if (pages > 0 && page > pages) { log(`已到最后一页（共 ${pages} 页），停止`); break; }
+        if (!(await gotoPage(page))) { log(`翻到第 ${page} 页失败，停止`); break; }
+
+        const todo = listRows().filter((r) => !isSubmitted(r.status) && !tried.has(r.id));
+        if (!todo.length) {
+          log(`—— 第 ${page} 页：没有待提交的了，翻下一页`);
+          page++;
+          continue;
         }
-        const todo = listRows().filter((r) => !isSubmitted(r.status));
-        if (!todo.length) { log('没有未提交的了 ✅'); break; }
-        log(`—— 第 ${round} 轮：还有 ${todo.length} 条未提交`);
+        log(`—— 第 ${page}/${pages} 页：待提交 ${todo.length} 条`);
+
         const row = todo[0];
-        const done = await submitOne(row, ok + fail + 1, ok + fail + todo.length);
-        if (done) ok++; else fail++;
-        if (round > 500) { log('轮次过多，保险起见停下'); break; }
+        const done = await submitOne(row, ok + fail + 1);
+        if (done) { ok++; } else { fail++; if (row.id) tried.add(row.id); }
+
+        // 提交完可能被带回第 1 页 → 下一轮 gotoPage(page) 会纠回来
+        if (!stopFlag && listReady() && currentPage() !== page) {
+          log(`（列表跳回第 ${currentPage()} 页，切回第 ${page} 页）`);
+        }
+        if (ok + fail > 2000) { log('处理条数过多，保险起见停下'); break; }
       }
     } catch (err) {
       log(`✗ 异常：${err && err.message ? err.message : err}`);

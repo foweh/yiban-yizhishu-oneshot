@@ -55,6 +55,14 @@ for (const file of targets) {
       `(编辑 ${editBtns} / 提交 ${submitBtns})`);
     ok(statusCells >= rows, '每行都有状态单元格 td.status-*', `(${statusCells} 个)`);
     ok(!hasFooter, '列表页不应有 footer.application-footer（否则会误判成编辑页）');
+    // 分页（脚本要能翻页继续提交）
+    const hasTotal = /mdc-data-table__pagination-total/.test(html);
+    const hasActive = /mdc-pagination__button--active/.test(html);
+    const jumper = html.match(/mdc-data-table__pagination-jumper-input[\s\S]{0,200}?<input[^>]*max="(\d+)"/);
+    ok(hasTotal, '有「共 N 条」(.mdc-data-table__pagination-total)');
+    ok(hasActive, '当前页有 mdc-pagination__button--active 标记');
+    ok(!!jumper, '跳页输入框带 max 属性（可直接算总页数）', jumper ? `(max=${jumper[1]})` : '');
+    ok(/data-next-page="true"/.test(html), '有「下一页」按钮 data-next-page');
   } else if (hasFooter) {
     // 编辑页
     ok(hasFooter, '找到编辑页 footer.application-footer');
